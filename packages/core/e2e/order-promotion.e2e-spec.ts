@@ -2625,6 +2625,93 @@ describe('Promotions applied to Orders', () => {
         });
     });
 
+    // #5605: recalculating an unchanged order must not cycle item promotions behind an order total condition
+    describe('item promotion with minimumOrderAmount condition', () => {
+        let promotion: PromotionFragment;
+
+        beforeAll(async () => {
+            adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+            shopClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+            promotion = await createPromotion({
+                enabled: true,
+                name: '50% off items over 10000',
+                conditions: [
+                    {
+                        code: minimumOrderAmount.code,
+                        arguments: [
+                            { name: 'amount', value: '10000' },
+                            { name: 'taxInclusive', value: 'false' },
+                        ],
+                    },
+                ],
+                actions: [
+                    {
+                        code: productsPercentageDiscount.code,
+                        arguments: [
+                            { name: 'discount', value: '50' },
+                            {
+                                name: 'productVariantIds',
+                                value: JSON.stringify([
+                                    getVariantBySlug('item-1000').id,
+                                    getVariantBySlug('item-5000').id,
+                                ]),
+                            },
+                        ],
+                    },
+                ],
+            });
+        });
+
+        afterAll(async () => {
+            await deletePromotion(promotion.id);
+        });
+
+        it('keeps the same discounts on every recalculation through to payment', async () => {
+            await shopClient.asAnonymousUser();
+            await shopClient.query(addItemToOrderDocument, {
+                productVariantId: getVariantBySlug('item-1000').id,
+                quantity: 6,
+            });
+            await shopClient.query(addItemToOrderDocument, {
+                productVariantId: getVariantBySlug('item-5000').id,
+                quantity: 1,
+            });
+
+            // 6000 + 5000 meets the minimum, so the first line gets 50% off. The discounted
+            // subtotal of 8000 no longer meets it, so the second line is not discounted.
+            const { activeOrder: firstCalculation } = await shopClient.query(getActiveOrderDocument);
+            expect(firstCalculation!.subTotal).toBe(8000);
+            expect(firstCalculation!.lines.map(l => l.discounts.length)).toEqual([1, 0]);
+
+            const secondLineId = firstCalculation!.lines[1].id;
+            for (let i = 0; i < 3; i++) {
+                const { adjustOrderLine } = await shopClient.query(adjustItemQuantityDocument, {
+                    orderLineId: secondLineId,
+                    quantity: 1,
+                });
+                orderResultGuard.assertSuccess(adjustOrderLine);
+                expect(adjustOrderLine.subTotal).toBe(8000);
+                expect(adjustOrderLine.lines.map(l => l.discounts.length)).toEqual([1, 0]);
+            }
+
+            await shopClient.query(setCustomerDocument, {
+                input: {
+                    emailAddress: 'minimum-order-amount@test.com',
+                    firstName: 'Guest',
+                    lastName: 'Customer',
+                },
+            });
+            await proceedToArrangingPayment(shopClient);
+            const order = await addPaymentToOrder(shopClient, testSuccessfulPaymentMethod);
+            orderResultGuard.assertSuccess(order);
+            expect(order.state).toBe('PaymentSettled');
+            expect(order.subTotal).toBe(8000);
+            expect(order.subTotalWithTax).toBe(9600);
+            expect(order.lines.map(l => l.discounts.length)).toEqual([1, 0]);
+            expect(order.payments![0].amount).toBe(order.totalWithTax);
+        });
+    });
+
     async function getProducts() {
         const result = await adminClient.query(getProductsWithVariantPricesDocument, {
             options: {
